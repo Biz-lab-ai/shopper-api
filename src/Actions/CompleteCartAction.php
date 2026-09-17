@@ -4,20 +4,25 @@ declare(strict_types=1);
 
 namespace Shopper\Api\Actions;
 
-use Illuminate\Validation\ValidationException;
 use Shopper\Api\Support\ShippingOption;
 use Shopper\Cart\Actions\CreateOrderFromCartAction;
 use Shopper\Cart\CartManager;
 use Shopper\Cart\Exceptions\CartCompletedException;
+use Shopper\Cart\Exceptions\DiscountLimitReachedException;
 use Shopper\Cart\Exceptions\InsufficientStockException;
 use Shopper\Cart\Exceptions\PriceChangedException;
 use Shopper\Cart\Models\Cart;
 use Shopper\Cart\Pipelines\CartPipelineContext;
 use Shopper\Core\Exceptions\CampaignBudgetExceededException;
 use Shopper\Core\Models\Contracts\Order;
+use Shopper\Http\Enum\ErrorCode;
+use Shopper\Http\Exceptions\ApiValidationException;
+use Shopper\Payment\Actions\SettlePayment;
 use Shopper\Payment\Enum\TransactionStatus;
 use Shopper\Payment\Enum\TransactionType;
+use Shopper\Payment\Jobs\SyncPendingPaymentJob;
 use Shopper\Payment\Models\PaymentTransaction;
+use Throwable;
 
 final readonly class CompleteCartAction
 {
@@ -25,6 +30,7 @@ final readonly class CompleteCartAction
         private GetCartShippingOptionsAction $shippingOptions,
         private CartManager $cartManager,
         private CreateOrderFromCartAction $createOrderFromCart,
+        private SettlePayment $settle,
     ) {}
 
     /**
@@ -46,13 +52,13 @@ final readonly class CompleteCartAction
         $cart->load(['zone.currency', 'zone.carriers', 'lines.purchasable', 'addresses.country', 'customer']);
 
         if ($cart->lines->isEmpty()) {
-            throw ValidationException::withMessages([
+            throw ApiValidationException::withCode(ErrorCode::CartEmpty, [
                 'cart' => __('shopper-api::messages.cart.empty'),
             ]);
         }
 
         if (! $cart->payment_method_id) {
-            throw ValidationException::withMessages([
+            throw ApiValidationException::withCode(ErrorCode::PaymentMethodRequired, [
                 'payment_method' => __('shopper-api::messages.payment.method_required'),
             ]);
         }
@@ -73,16 +79,55 @@ final readonly class CompleteCartAction
 
             return $order;
         } catch (CampaignBudgetExceededException) {
-            throw ValidationException::withMessages([
+            throw ApiValidationException::withCode(ErrorCode::PromotionBudgetReached, [
                 'promotion' => __('shopper-cart::messages.discount.campaign_budget_reached'),
             ]);
-        } catch (InsufficientStockException|PriceChangedException $exception) {
-            throw ValidationException::withMessages([
+        } catch (DiscountLimitReachedException $exception) {
+            throw ApiValidationException::withCode(ErrorCode::PromotionLimitReached, [
+                'promotion' => $exception->getMessage(),
+            ]);
+        } catch (InsufficientStockException $exception) {
+            throw ApiValidationException::withCode(ErrorCode::StockInsufficient, [
+                'cart' => $exception->getMessage(),
+            ]);
+        } catch (PriceChangedException $exception) {
+            throw ApiValidationException::withCode(ErrorCode::PriceChanged, [
                 'cart' => $exception->getMessage(),
             ]);
         }
 
+        $this->settlePayment($cart, $order);
+
         return $order;
+    }
+
+    /**
+     * The browser confirms the payment before the storefront completes the
+     * cart, so the provider often speaks before the order exists. Once the
+     * order and its initiate transaction are committed, the events that
+     * landed early are replayed, and a provider check is queued for a
+     * payment still pending: the response never waits on the provider, and
+     * placement is never blocked by the settlement. The order is the durable
+     * anchor, the scheduled reconciliation is the safety net.
+     */
+    private function settlePayment(Cart $cart, Order $order): void
+    {
+        $reference = $cart->payment_session['reference'] ?? null;
+
+        if (! is_string($reference)) {
+            return;
+        }
+
+        try {
+            $this->settle->execute($reference);
+
+            if (config('shopper.payment.reconciliation.pull_on_completion', true)) {
+                SyncPendingPaymentJob::dispatch($order->getKey(), $reference)
+                    ->onQueue(config('shopper.payment.reconciliation.queue'));
+            }
+        } catch (Throwable $exception) {
+            report($exception);
+        }
     }
 
     /**
@@ -99,7 +144,7 @@ final readonly class CompleteCartAction
         $email = $cart->customer?->getAttribute('email');
 
         if (! is_string($email)) {
-            throw ValidationException::withMessages([
+            throw ApiValidationException::withCode(ErrorCode::EmailRequired, [
                 'email' => __('shopper-api::messages.cart.email_required'),
             ]);
         }
@@ -120,7 +165,7 @@ final readonly class CompleteCartAction
         }
 
         if (! $cart->shipping_option_id) {
-            throw ValidationException::withMessages([
+            throw ApiValidationException::withCode(ErrorCode::ShippingMethodRequired, [
                 'shipping_method' => __('shopper-api::messages.shipping.method_required'),
             ]);
         }
@@ -133,7 +178,7 @@ final readonly class CompleteCartAction
         );
 
         if (! $option) {
-            throw ValidationException::withMessages([
+            throw ApiValidationException::withCode(ErrorCode::ShippingOptionUnavailable, [
                 'shipping_method' => __('shopper-api::messages.shipping.option_gone'),
             ]);
         }
@@ -142,7 +187,7 @@ final readonly class CompleteCartAction
         $frozen = $cart->shipping_amount;
 
         if ($frozen !== null && $quoted > $frozen) {
-            throw ValidationException::withMessages([
+            throw ApiValidationException::withCode(ErrorCode::ShippingPriceChanged, [
                 'shipping_method' => __('shopper-api::messages.shipping.price_changed'),
             ]);
         }
@@ -152,18 +197,17 @@ final readonly class CompleteCartAction
         }
     }
 
-    /**
-     * An open payment session must match what the order will charge, in
-     * amount and in currency: a total or a currency that moved since the
-     * intent was created would collect the wrong money. Runs under the cart
-     * lock against the exact total the order freezes. The client recreates
-     * the session against the new total and retries.
-     */
     private function guardPaymentSession(Cart $cart, int $total): void
     {
         $session = $cart->payment_session;
 
         if (! $session || ! isset($session['amount'])) {
+            if (($cart->paymentMethod->driver ?? 'manual') !== 'manual') {
+                throw ApiValidationException::withCode(ErrorCode::PaymentSessionRequired, [
+                    'payment_session' => __('shopper-api::messages.payment.session_required'),
+                ]);
+            }
+
             return;
         }
 
@@ -171,7 +215,7 @@ final readonly class CompleteCartAction
             $session['amount'] !== $total
             || (isset($session['currency']) && $session['currency'] !== $cart->currency_code)
         ) {
-            throw ValidationException::withMessages([
+            throw ApiValidationException::withCode(ErrorCode::PaymentSessionMismatch, [
                 'payment_session' => __('shopper-api::messages.payment.session_mismatch'),
             ]);
         }

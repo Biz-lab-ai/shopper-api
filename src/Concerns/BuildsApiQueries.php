@@ -11,10 +11,12 @@ use Illuminate\Pagination\CursorPaginator;
 use Illuminate\Pagination\LengthAwarePaginator;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Collection;
-use Illuminate\Validation\ValidationException;
+use Shopper\Http\Enum\ErrorCode;
+use Shopper\Http\Exceptions\ApiValidationException;
 use Spatie\QueryBuilder\AllowedFilter;
 use Spatie\QueryBuilder\AllowedInclude;
 use Spatie\QueryBuilder\AllowedSort;
+use Spatie\QueryBuilder\Exceptions\InvalidIncludeQuery;
 use Spatie\QueryBuilder\Includes\IncludeInterface;
 use Spatie\QueryBuilder\QueryBuilder;
 use Spatie\QueryBuilder\QueryBuilderRequest;
@@ -39,18 +41,12 @@ trait BuildsApiQueries
         $allowlist = (array) config('shopper.api.resources.'.$resource, []);
         $request = QueryBuilderRequest::fromRequest(request());
 
-        $builder = QueryBuilder::for($query, $request)
+        $query->with($this->requestedIncludeLoads($resource));
+
+        return QueryBuilder::for($query, $request)
             ->allowedFilters(...$this->allowedFilters((array) ($allowlist['filters'] ?? [])), ...$extraFilters)
             ->allowedSorts(...$this->allowedSorts((array) ($allowlist['sorts'] ?? [])))
             ->allowedIncludes(...$this->allowedIncludes((array) ($allowlist['includes'] ?? [])));
-
-        $loads = $this->requestedIncludeLoads($resource);
-
-        if ($loads !== []) {
-            $builder->with($loads);
-        }
-
-        return $builder;
     }
 
     /**
@@ -73,7 +69,7 @@ trait BuildsApiQueries
         $loads = [];
 
         foreach (QueryBuilderRequest::fromRequest(request())->includes() as $include) {
-            $loads = array_merge($loads, $map[$include] ?? []);
+            $loads = array_merge($loads, $map[$include] ?? $map[explode('.', $include, 2)[0]] ?? []);
         }
 
         return array_values(array_unique($loads));
@@ -97,8 +93,10 @@ trait BuildsApiQueries
      * includes straight from the query string, so without this the relations
      * are lazy-loaded at serialization time with no constraint at all.
      *
-     * @param  Builder<Model>  $query
-     * @return Builder<Model>
+     * @template TModel of Model
+     *
+     * @param  Builder<TModel>  $query
+     * @return Builder<TModel>
      */
     protected function applyPublicIncludes(string $resource, Builder $query): Builder
     {
@@ -107,16 +105,31 @@ trait BuildsApiQueries
         /** @var array<int|string, string> $includes */
         $includes = (array) config('shopper.api.resources.'.$resource.'.includes', []);
 
+        $allowed = (new Collection($includes))
+            ->map(fn (string $value, int|string $name): string => is_int($name) ? $value : $name)
+            ->values();
+
+        $unknown = $requested->diff($allowed);
+
+        if ($unknown->isNotEmpty()) {
+            throw InvalidIncludeQuery::includesNotAllowed($unknown, $allowed);
+        }
+
         foreach ($includes as $name => $class) {
-            if (is_int($name) || ! $requested->contains($name)) {
+            if (is_int($name)) {
+                $query->when($requested->contains($class), fn (Builder $query) => $query->with($class));
+
                 continue;
             }
 
+            if (! $requested->contains($name)) {
+                continue;
+            }
+
+            /** @var IncludeInterface<TModel> $include */
             $include = resolve($class);
 
-            if ($include instanceof IncludeInterface) {
-                $include($query, $name);
-            }
+            $include($query, $name);
         }
 
         return $query;
@@ -192,7 +205,7 @@ trait BuildsApiQueries
                     ->sum(fn (mixed $value): int => mb_substr_count((string) $value, ',') + 1);
 
                 if ($breadth > self::MAX_FILTER_VALUES) {
-                    throw ValidationException::withMessages([
+                    throw ApiValidationException::withCode(ErrorCode::FilterTooWide, [
                         'filter.'.$filter => __('shopper-api::messages.catalog.filter_too_wide', ['max' => self::MAX_FILTER_VALUES]),
                     ]);
                 }

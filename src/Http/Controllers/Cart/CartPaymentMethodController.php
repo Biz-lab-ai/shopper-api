@@ -6,17 +6,19 @@ namespace Shopper\Api\Http\Controllers\Cart;
 
 use Illuminate\Http\Request;
 use Illuminate\Support\Collection;
-use Illuminate\Validation\ValidationException;
+use Shopper\Api\Actions\CancelPaymentSessionAction;
 use Shopper\Api\Concerns\RespondsWithCart;
 use Shopper\Api\Http\Requests\Cart\SetPaymentMethodRequest;
+use Shopper\Api\Http\Resources\JsonApiResource;
+use Shopper\Api\Http\Resources\JsonApiResourceCollection;
 use Shopper\Api\Http\Resources\PaymentMethodResource;
 use Shopper\Cart\CartManager;
 use Shopper\Cart\Models\Cart;
 use Shopper\Core\Models\PaymentMethod;
+use Shopper\Http\Enum\ErrorCode;
+use Shopper\Http\Exceptions\ApiValidationException;
 use Shopper\Payment\PaymentManager;
 use Shopper\Payment\Services\PaymentProcessingService;
-use TiMacDonald\JsonApi\JsonApiResource;
-use TiMacDonald\JsonApi\JsonApiResourceCollection;
 
 final class CartPaymentMethodController
 {
@@ -26,6 +28,7 @@ final class CartPaymentMethodController
         private readonly PaymentProcessingService $paymentService,
         private readonly PaymentManager $paymentManager,
         private readonly CartManager $cartManager,
+        private readonly CancelPaymentSessionAction $cancelSession,
     ) {}
 
     /**
@@ -45,7 +48,9 @@ final class CartPaymentMethodController
      * Set the payment method of a cart.
      *
      * The method is referenced by its public id, as listed by the payment
-     * methods endpoint. A method outside the cart's offer is rejected.
+     * methods endpoint. A method outside the cart's offer is rejected. A
+     * session opened for the previous method is dropped and its intent
+     * cancelled, so an order never journals a reference of another method.
      */
     public function store(SetPaymentMethodRequest $request, string $cartId): JsonApiResource
     {
@@ -57,12 +62,18 @@ final class CartPaymentMethodController
         );
 
         if (! $method) {
-            throw ValidationException::withMessages([
+            throw ApiValidationException::withCode(ErrorCode::PaymentMethodUnavailable, [
                 'payment_method_id' => __('shopper-api::messages.payment.method_not_available'),
             ]);
         }
 
+        $previous = $cart->payment_session;
+
         $this->mutateCart(fn () => $this->cartManager->setPaymentMethod($cart, $method->id));
+
+        if ($cart->payment_session === null) {
+            $this->cancelSession->execute($previous);
+        }
 
         return $this->cartResource($cart->refresh());
     }

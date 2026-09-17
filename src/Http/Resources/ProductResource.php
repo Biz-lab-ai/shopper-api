@@ -5,15 +5,11 @@ declare(strict_types=1);
 namespace Shopper\Api\Http\Resources;
 
 use Illuminate\Http\Request;
-use Illuminate\Support\Collection;
 use Shopper\Api\Concerns\SerializesMedia;
 use Shopper\Api\Concerns\SerializesPrices;
 use Shopper\Core\Models\Attribute;
-use Shopper\Core\Models\AttributeProduct;
 use Shopper\Core\Models\AttributeValue;
 use Shopper\Core\Models\Product;
-use Spatie\MediaLibrary\HasMedia as SpatieHasMedia;
-use Spatie\MediaLibrary\MediaCollections\Models\Media;
 
 /**
  * @mixin Product
@@ -51,6 +47,7 @@ class ProductResource extends JsonApiResource
             'thumbnail' => $this->thumbnailPayload(withFallback: true),
             ...($this->isVirtual() ? ['files' => $this->filesPayload()] : []),
             ...$this->ratingPayload(),
+            ...$this->optionsPayload(),
             'created_at' => $this->created_at->toIso8601String(),
             'updated_at' => $this->updated_at->toIso8601String(),
         ];
@@ -59,19 +56,15 @@ class ProductResource extends JsonApiResource
     public function toRelationships(Request $request): array
     {
         $relationships = [
-            'brand' => fn () => BrandResource::make($this->brand),
-            'categories' => fn () => CategoryResource::collection($this->categories),
-            'collections' => fn () => CollectionResource::collection($this->collections),
-            'tags' => fn () => TagResource::collection($this->tags),
-            'relatedProducts' => fn () => ProductResource::collection($this->relatedProducts),
+            'brand' => BrandResource::class,
+            'categories' => CategoryResource::class,
+            'collections' => CollectionResource::class,
+            'tags' => TagResource::class,
+            'relatedProducts' => self::class,
         ];
 
         if ($this->canUseVariants()) {
-            $relationships['variants'] = fn () => ProductVariantResource::collection($this->variants);
-        }
-
-        if ($this->canUseAttributes()) {
-            $relationships['options'] = fn () => AttributeResource::collection($this->scopedOptions());
+            $relationships['variants'] = ProductVariantResource::class;
         }
 
         return $relationships;
@@ -134,6 +127,39 @@ class ProductResource extends JsonApiResource
     }
 
     /**
+     * @return array<string, array<int, array<string, mixed>>>
+     */
+    private function optionsPayload(): array
+    {
+        if (! $this->canUseAttributes() || ! $this->resource->relationLoaded('options')) {
+            return [];
+        }
+
+        return [
+            'options' => $this->options
+                ->map(fn (Attribute $option): array => [
+                    'name' => $option->name,
+                    'slug' => $option->slug,
+                    'description' => $option->description,
+                    'type' => $option->type->value,
+                    'icon' => $option->icon,
+                    'custom_value' => $option->custom_value ?? null,
+                    'values' => $option->values
+                        ->map(fn (AttributeValue $value): array => [
+                            'key' => $value->key,
+                            'value' => $value->value,
+                            'position' => $value->position,
+                            'swatch_url' => $value->swatch_url ?? null,
+                        ])
+                        ->values()
+                        ->all(),
+                ])
+                ->values()
+                ->all(),
+        ];
+    }
+
+    /**
      * The min/max price aggregate in the currency resolved for the request,
      * batch-loaded by the controller (LoadsPriceRange). Null when the product
      * has no price in that currency; absent on responses that do not load it.
@@ -157,65 +183,5 @@ class ProductResource extends JsonApiResource
                 'max' => (int) $raw['price_range_max'],
             ],
         ];
-    }
-
-    /**
-     * The product's option types (Color, Storage, ...), deduplicated, with each
-     * option's values narrowed to the ones this product actually uses (from the
-     * options pivot). A storefront then only renders the relevant swatches and
-     * builds combinations from the selected values, not every global value.
-     *
-     * @return Collection<int, Attribute>
-     */
-    private function scopedOptions(): Collection
-    {
-        $usedValueIds = $this->options
-            ->pluck('pivot.attribute_value_id')
-            ->filter()
-            ->unique();
-
-        $swatches = $this->swatchUrlMap();
-
-        return $this->options
-            ->unique('id')
-            ->values()
-            ->each(fn (Attribute $option) => $option->setRelation(
-                'values',
-                $option->values
-                    ->whereIn('id', $usedValueIds)
-                    ->each(function (AttributeValue $value) use ($swatches): void {
-                        $value->swatch_url = $swatches[$value->id] ?? null;
-                    })
-                    ->values(),
-            ));
-    }
-
-    /**
-     * Per-product swatch image URL for each attribute value, read from the
-     * product's `attribute_product` rows. Empty unless `attributeProducts.media`
-     * was eager-loaded (the `options` include), keeping listings N+1 free.
-     *
-     * @return array<int, string>
-     */
-    private function swatchUrlMap(): array
-    {
-        if (! $this->resource->relationLoaded('attributeProducts')) {
-            return [];
-        }
-
-        return $this->attributeProducts
-            ->filter(fn (AttributeProduct $attributeProduct): bool => $attributeProduct->attribute_value_id !== null)
-            ->mapWithKeys(function (AttributeProduct $attributeProduct): array {
-                $url = '';
-
-                if ($attributeProduct instanceof SpatieHasMedia) {
-                    $media = $attributeProduct->getMedia('swatch')->first();
-                    $url = $media instanceof Media ? $media->getFullUrl() : '';
-                }
-
-                return [$attributeProduct->attribute_value_id => $url];
-            })
-            ->filter(fn (string $url): bool => $url !== '')
-            ->all();
     }
 }

@@ -7,9 +7,9 @@ namespace Shopper\Api\Http\Controllers\Account;
 use Illuminate\Http\Request;
 use Shopper\Api\Concerns\BuildsApiQueries;
 use Shopper\Api\Concerns\RespondsWithOrder;
+use Shopper\Api\Http\Resources\JsonApiResource;
+use Shopper\Api\Http\Resources\JsonApiResourceCollection;
 use Shopper\Api\Http\Resources\OrderResource;
-use TiMacDonald\JsonApi\JsonApiResource;
-use TiMacDonald\JsonApi\JsonApiResourceCollection;
 
 final class OrderController
 {
@@ -36,27 +36,19 @@ final class OrderController
      * Retrieve one of the customer's orders.
      *
      * The full order view: expand what the account page needs through
-     * `include=items,shipping_address,billing_address,payment_method,shippings,shippings.events,refund`.
+     * `include=items,shippingAddress,billingAddress,paymentMethod,shippings,shippings.events,refund`.
      * Orders of other customers answer 404, indistinguishable from an order
      * that does not exist.
      */
     public function show(Request $request, string $orderId): JsonApiResource
     {
-        $order = $this->orderQuery()
+        $query = $this->orderQuery()
+            ->with($this->requestedIncludeLoads('order'))
             ->where('customer_id', $request->user()?->getAuthIdentifier())
-            ->where('public_id', $orderId)
-            ->firstOrFail();
+            ->where('public_id', $orderId);
 
-        $order->load([
-            'items',
-            'shippingAddress',
-            'billingAddress',
-            'paymentMethod',
-            'shippings.carrier',
-            'shippings.events',
-            'refund',
-        ]);
+        $this->applyPublicIncludes('order', $query);
 
-        return OrderResource::make($order);
+        return OrderResource::make($query->firstOrFail());
     }
 }

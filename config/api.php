@@ -21,6 +21,19 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Token expiration
+    |--------------------------------------------------------------------------
+    |
+    | Here you may set how many minutes a customer token issued by the store
+    | authentication endpoints stays valid. A null or zero value keeps the token alive
+    | until the customer logs out or resets their password. Expired tokens
+    | answer 401 and are pruned daily.
+    |
+    */
+    'token_expiration' => env('SHOPPER_API_TOKEN_EXPIRATION', 60 * 24 * 30),
+
+    /*
+    |--------------------------------------------------------------------------
     | Resource query allowlists
     |--------------------------------------------------------------------------
     |
@@ -51,7 +64,7 @@ return [
                 'variants',
                 'categories' => Shopper\Api\Http\Includes\VisibleCategories::class,
                 'collections' => Shopper\Api\Http\Includes\PublishedRelation::class,
-                'options',
+                'options' => Shopper\Api\Http\Includes\ScopedOptions::class,
                 'tags',
                 'relatedProducts' => Shopper\Api\Http\Includes\PublicProducts::class,
                 'rating' => Shopper\Api\Http\Includes\RatingAggregate::class,
@@ -59,7 +72,6 @@ return [
             ],
             'include_loads' => [
                 'variants' => ['variants.prices.currency', 'variants.values.attribute'],
-                'options' => ['options.values', 'attributeProducts.media'],
                 'categories' => ['categories.parent'],
             ],
         ],
@@ -69,7 +81,7 @@ return [
             'includes' => [
                 'parent' => Shopper\Api\Http\Includes\EnabledRelation::class,
                 'children' => Shopper\Api\Http\Includes\EnabledRelation::class,
-                'ancestors' => Shopper\Api\Http\Includes\EnabledRelation::class,
+                'ancestors' => Shopper\Api\Http\Includes\EnabledAncestors::class,
                 'products' => Shopper\Api\Http\Includes\PublicProducts::class,
                 'products_count' => Shopper\Api\Http\Includes\SubtreeProductsCount::class,
             ],
@@ -95,7 +107,7 @@ return [
         ],
         'attribute' => [
             'filters' => ['name' => 'partial'],
-            'sorts' => ['name', 'position'],
+            'sorts' => ['name'],
             'includes' => [],
         ],
         'tag' => [
@@ -126,10 +138,16 @@ return [
             'sorts' => ['name', 'code'],
             'includes' => [],
         ],
+        'cart' => [
+            'includes' => ['lines', 'lines.purchasable', 'lines.purchasable.product', 'addresses', 'paymentMethod'],
+        ],
         'order' => [
             'filters' => ['status' => 'exact'],
             'sorts' => ['created_at'],
-            'includes' => ['items'],
+            'includes' => ['items', 'shippingAddress', 'billingAddress', 'paymentMethod', 'shippings', 'shippings.events', 'refund'],
+            'include_loads' => [
+                'shippings' => ['shippings.carrier'],
+            ],
         ],
         'review' => [
             'filters' => ['rating' => 'exact'],
