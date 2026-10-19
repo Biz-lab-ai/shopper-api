@@ -24,17 +24,27 @@
     "illuminate/support": "^12.68|^13.27",
     "illuminate/validation": "^12.68|^13.27",
     "laravel/prompts": "^0.3.16",
-    "shopper/cart": "self.version",
-    "shopper/core": "self.version",
-    "shopper/http": "self.version",
-    "shopper/payment": "self.version",
-    "shopper/shipping": "self.version",
+    "shopper/cart": "3.0.0-rc.3",
+    "shopper/core": "3.0.0-rc.3",
+    "shopper/http": "3.0.0-rc.3",
+    "shopper/payment": "3.0.0-rc.3",
+    "shopper/shipping": "3.0.0-rc.3",
     "spatie/laravel-medialibrary": "^11.5",
     "spatie/laravel-query-builder": "^7.3"
+  },
+  "require-dev": {
+    "orchestra/testbench": "^10.0|^11.0",
+    "pestphp/pest": "^3.8|^4.0",
+    "pestphp/pest-plugin-laravel": "^3.0|^4.0"
   },
   "autoload": {
     "psr-4": {
       "Shopper\\Api\\": "src/"
+    }
+  },
+  "autoload-dev": {
+    "psr-4": {
+      "Shopper\\Api\\Tests\\": "tests/"
     }
   },
   "extra": {
@@ -45,7 +55,10 @@
     }
   },
   "config": {
-    "sort-packages": true
+    "sort-packages": true,
+    "allow-plugins": {
+      "pestphp/pest-plugin": true
+    }
   },
   "minimum-stability": "dev",
   "prefer-stable": true

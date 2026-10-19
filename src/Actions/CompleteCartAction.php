@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Shopper\Api\Actions;
 
+use LogicException;
 use Shopper\Cart\Actions\CreateOrderFromCartAction;
 use Shopper\Cart\CartManager;
 use Shopper\Cart\Exceptions\CartCompletedException;
@@ -16,6 +17,7 @@ use Shopper\Cart\Exceptions\QuantityRuleViolationException;
 use Shopper\Cart\Models\Cart;
 use Shopper\Cart\Pipelines\CartPipelineContext;
 use Shopper\Core\Contracts\PaymentSessionGateway;
+use Shopper\Core\Contracts\StockTransactionRunner;
 use Shopper\Core\Exceptions\CampaignBudgetExceededException;
 use Shopper\Core\Models\Contracts\Order;
 use Shopper\Http\Enum\ErrorCode;
@@ -46,6 +48,10 @@ final readonly class CompleteCartAction
      */
     public function execute(Cart $cart): Order
     {
+        if ($cart->getConnection()->transactionLevel() > 0) {
+            throw new LogicException('A cart is completed outside any open transaction: its compensations must never sit under a foreign rollback.');
+        }
+
         if ($cart->isCompleted()) {
             /** @var Order $order */
             $order = $cart->order()->firstOrFail();
@@ -56,6 +62,13 @@ final readonly class CompleteCartAction
         return $this->cartManager->withPaymentSessionLock($cart, fn (): Order => $this->complete($cart->unsetRelations()->refresh()));
     }
 
+    /**
+     * The preparation (email, shipping re-quote with a possible release of
+     * the payment session, the payment read) runs once, committed, before
+     * the stock runner. Only the order transaction is repeated, over a cart
+     * loaded again by key; the compensations of a business refusal run
+     * after the rollback, outside the runner, over a freshly loaded cart.
+     */
     private function complete(Cart $cart): Order
     {
         if ($cart->isCompleted()) {
@@ -99,39 +112,41 @@ final readonly class CompleteCartAction
             $isCollected();
         }
 
+        $cartClass = $cart::class;
+        $cartId = $cart->getKey();
+        $preparedChecked = $checked;
+        $preparedCollected = $collected;
+
         try {
-            $order = $this->createOrderFromCart->execute(
-                $cart,
-                fn (CartPipelineContext $context) => $this->guardPaymentSession($cart, $context->total),
-                fn (Order $order) => $this->recordInitiatedPayment($cart, $order),
-                fn (): bool => $cart->payment_session === $session && $isCollected() !== false,
+            $order = resolve(StockTransactionRunner::class)->retry(
+                static fn (): Order => app(self::class)->attempt($cartClass, $cartId, $session, $preparedChecked, $preparedCollected),
             );
         } catch (CartCompletedException) {
             /** @var Order $order */
-            $order = $cart->refresh()->order()->firstOrFail();
+            $order = $this->freshCart($cartClass, $cartId)->order()->firstOrFail();
 
             return $order;
         } catch (CampaignBudgetExceededException) {
-            $this->reopenPromotions($cart);
+            $this->reopenPromotions($this->freshCart($cartClass, $cartId));
 
             throw ApiValidationException::withCode(ErrorCode::PromotionBudgetReached, [
                 'promotion' => __('shopper-cart::messages.discount.campaign_budget_reached'),
             ]);
         } catch (PromotionUnavailableException $exception) {
-            $this->reopenPromotions($cart);
+            $this->reopenPromotions($this->freshCart($cartClass, $cartId));
 
             throw ApiValidationException::withCode(ErrorCode::PromotionNotApplicable, [
                 'promotion' => $exception->getMessage(),
             ]);
         } catch (DiscountLimitReachedException $exception) {
-            $this->reopenPromotions($cart);
+            $this->reopenPromotions($this->freshCart($cartClass, $cartId));
 
             throw ApiValidationException::withCode(ErrorCode::PromotionLimitReached, [
                 'promotion' => $exception->getMessage(),
             ]);
         } catch (InsufficientStockException $exception) {
             if ($session !== null && $isCollected() !== false && $this->paymentSessions->refund($session)) {
-                $this->cartManager->setPaymentSession($cart, null);
+                $this->cartManager->setPaymentSession($this->freshCart($cartClass, $cartId), null);
 
                 throw ApiValidationException::withCode(ErrorCode::PaymentReleased, [
                     'cart' => __('shopper-api::messages.payment.released'),
@@ -146,11 +161,13 @@ final readonly class CompleteCartAction
         } catch (QuantityRuleViolationException $exception) {
             throw ApiValidationException::withCode(ErrorCode::QuantityRuleViolated, ['cart' => $exception->getMessage()], $exception->context());
         } catch (PriceChangedException $exception) {
+            $fresh = $this->freshCart($cartClass, $cartId);
+
             try {
-                $this->cartManager->reprice($cart);
+                $this->cartManager->reprice($fresh);
             } catch (CartCompletedException) {
                 /** @var Order $order */
-                $order = $cart->refresh()->order()->firstOrFail();
+                $order = $fresh->refresh()->order()->firstOrFail();
 
                 return $order;
             }
@@ -160,9 +177,52 @@ final readonly class CompleteCartAction
             ]);
         }
 
-        $this->settlePayment($cart, $order);
+        $this->settlePayment($this->freshCart($cartClass, $cartId), $order);
 
         return $order;
+    }
+
+    /**
+     * One attempt of the order transaction. Everything it reads is loaded
+     * again by key and the three checks are built over this cart with
+     * their own flags, so a repeated attempt never sees what a rolled back
+     * one left in memory. The payment read of the preparation is reused;
+     * a read the preparation did not need is made lazily, once per attempt.
+     *
+     * @param  class-string<Cart>  $cartClass
+     * @param  array<string, mixed>|null  $session
+     */
+    private function attempt(string $cartClass, int|string $cartId, ?array $session, bool $checked, ?bool $collected): Order
+    {
+        $cart = $this->freshCart($cartClass, $cartId);
+        $cart->load(['zone.currency', 'zone.carriers', $cart->payment_session === null ? 'lines.purchasable' : 'lines.purchasable.prices.currency', 'addresses.country', 'customer']);
+
+        $isCollected = function () use ($session, &$checked, &$collected): ?bool {
+            if (! $checked) {
+                $collected = $session === null ? false : $this->paymentSessions->collected($session);
+                $checked = true;
+            }
+
+            return $collected;
+        };
+
+        return $this->createOrderFromCart->execute(
+            $cart,
+            fn (CartPipelineContext $context) => $this->guardPaymentSession($cart, $context->total),
+            fn (Order $order) => $this->recordInitiatedPayment($cart, $order),
+            fn (): bool => $cart->payment_session === $session && $isCollected() !== false,
+        );
+    }
+
+    /**
+     * @param  class-string<Cart>  $cartClass
+     */
+    private function freshCart(string $cartClass, int|string $cartId): Cart
+    {
+        /** @var Cart $cart */
+        $cart = $cartClass::query()->findOrFail($cartId);
+
+        return $cart;
     }
 
     /**
