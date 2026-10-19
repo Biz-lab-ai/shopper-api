@@ -5,6 +5,31 @@ declare(strict_types=1);
 return [
     /*
     |--------------------------------------------------------------------------
+    | Routes
+    |--------------------------------------------------------------------------
+    |
+    | Whether the package registers its store routes. Turned off, the actions
+    | and listeners stay available to the host application, which exposes
+    | its own endpoints.
+    |
+    */
+    'routes' => true,
+
+    /*
+    |--------------------------------------------------------------------------
+    | Completion requires a captured payment
+    |--------------------------------------------------------------------------
+    |
+    | When enabled, a cart holding a provider payment session is only
+    | completed once the provider reports the payment captured, for the cart
+    | total and in the cart currency. Any other state refuses the completion
+    | before the order, the stock reservation and the cart completion.
+    |
+    */
+    'complete_requires_capture' => false,
+
+    /*
+    |--------------------------------------------------------------------------
     | Pagination
     |--------------------------------------------------------------------------
     |

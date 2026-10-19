@@ -6,6 +6,7 @@ namespace Shopper\Api\Listeners;
 
 use Illuminate\Contracts\Cache\LockTimeoutException;
 use Shopper\Api\Actions\CompleteCartAction;
+use Shopper\Api\Exceptions\PaymentNotCapturedException;
 use Shopper\Cart\Models\Cart;
 use Shopper\Cart\Models\Contracts\Cart as CartContract;
 use Shopper\Core\Events\Payments\PaymentOrphaned;
@@ -32,6 +33,12 @@ final readonly class CompleteOrphanedCart
             $this->completeCart->execute($cart);
         } catch (LockTimeoutException|PaymentProviderUnavailableException) {
             $event->defer();
+
+            return;
+        } catch (PaymentNotCapturedException $exception) {
+            if ($exception->status === 'processing') {
+                $event->defer();
+            }
 
             return;
         } catch (ApiValidationException $exception) {

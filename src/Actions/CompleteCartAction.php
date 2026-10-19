@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Shopper\Api\Actions;
 
 use LogicException;
+use Shopper\Api\Exceptions\PaymentNotCapturedException;
 use Shopper\Cart\Actions\CreateOrderFromCartAction;
 use Shopper\Cart\CartManager;
 use Shopper\Cart\Exceptions\CartCompletedException;
@@ -19,14 +20,18 @@ use Shopper\Cart\Pipelines\CartPipelineContext;
 use Shopper\Core\Contracts\PaymentSessionGateway;
 use Shopper\Core\Contracts\StockTransactionRunner;
 use Shopper\Core\Exceptions\CampaignBudgetExceededException;
+use Shopper\Core\Exceptions\PaymentProviderUnavailableException;
 use Shopper\Core\Models\Contracts\Order;
 use Shopper\Http\Enum\ErrorCode;
 use Shopper\Http\Exceptions\ApiValidationException;
 use Shopper\Payment\Actions\SettlePayment;
+use Shopper\Payment\Contracts\CompensationStore;
 use Shopper\Payment\Enum\TransactionStatus;
 use Shopper\Payment\Enum\TransactionType;
 use Shopper\Payment\Jobs\SyncPendingPaymentJob;
 use Shopper\Payment\Models\PaymentTransaction;
+use Shopper\Payment\PaymentManager;
+use Shopper\Payment\PaymentReferenceLock;
 use Throwable;
 
 final readonly class CompleteCartAction
@@ -59,7 +64,30 @@ final readonly class CompleteCartAction
             return $order;
         }
 
-        return $this->cartManager->withPaymentSessionLock($cart, fn (): Order => $this->complete($cart->unsetRelations()->refresh()));
+        return $this->cartManager->withPaymentSessionLock($cart, fn (): Order => $this->completeUnderPaymentLock($cart->unsetRelations()->refresh()));
+    }
+
+    /**
+     * A provider payment is completed under the lock of its reference, the
+     * one every refund of that payment takes: a payment whose refund was
+     * decided is never turned into an order.
+     */
+    private function completeUnderPaymentLock(Cart $cart): Order
+    {
+        if ($cart->isCompleted()) {
+            /** @var Order $order */
+            $order = $cart->order()->firstOrFail();
+
+            return $order;
+        }
+
+        $reference = $cart->payment_session['reference'] ?? null;
+
+        if (! $cart->holdsProviderPaymentSession() || ! is_string($reference)) {
+            return $this->complete($cart);
+        }
+
+        return PaymentReferenceLock::run($reference, fn (): Order => $this->complete($cart));
     }
 
     /**
@@ -71,11 +99,12 @@ final readonly class CompleteCartAction
      */
     private function complete(Cart $cart): Order
     {
-        if ($cart->isCompleted()) {
-            /** @var Order $order */
-            $order = $cart->order()->firstOrFail();
+        $reference = $cart->holdsProviderPaymentSession() ? ($cart->payment_session['reference'] ?? null) : null;
 
-            return $order;
+        if (is_string($reference) && $this->compensations()?->compensated($reference)) {
+            throw ApiValidationException::withCode(ErrorCode::PaymentReleased, [
+                'cart' => __('shopper-api::messages.payment.released'),
+            ]);
         }
 
         $cart->load(['zone.currency', 'zone.carriers', $cart->payment_session === null ? 'lines.purchasable' : 'lines.purchasable.prices.currency', 'addresses.country', 'customer']);
@@ -106,6 +135,14 @@ final readonly class CompleteCartAction
             return $collected;
         };
 
+        $capturedAmount = null;
+
+        if ($session !== null && $cart->holdsProviderPaymentSession() && config('shopper.api.complete_requires_capture', false)) {
+            $capturedAmount = $this->capturedAmount($cart, $session);
+            $checked = true;
+            $collected = true;
+        }
+
         $this->refreshShipping->execute($cart, $isCollected);
 
         if ($session !== null && ($this->cartManager->needsRevalidation($cart) || ($cart->holdsProviderPaymentSession() && $cart->promotions()->where('computed_amount', '>', 0)->exists()))) {
@@ -119,7 +156,7 @@ final readonly class CompleteCartAction
 
         try {
             $order = resolve(StockTransactionRunner::class)->retry(
-                static fn (): Order => app(self::class)->attempt($cartClass, $cartId, $session, $preparedChecked, $preparedCollected),
+                static fn (): Order => app(self::class)->attempt($cartClass, $cartId, $session, $preparedChecked, $preparedCollected, $capturedAmount),
             );
         } catch (CartCompletedException) {
             /** @var Order $order */
@@ -145,7 +182,7 @@ final readonly class CompleteCartAction
                 'promotion' => $exception->getMessage(),
             ]);
         } catch (InsufficientStockException $exception) {
-            if ($session !== null && $isCollected() !== false && $this->paymentSessions->refund($session)) {
+            if ($session !== null && $isCollected() !== false && $this->paymentSessions->refund([...$session, 'cause' => 'stock_insufficient'])) {
                 $this->cartManager->setPaymentSession($this->freshCart($cartClass, $cartId), null);
 
                 throw ApiValidationException::withCode(ErrorCode::PaymentReleased, [
@@ -192,7 +229,7 @@ final readonly class CompleteCartAction
      * @param  class-string<Cart>  $cartClass
      * @param  array<string, mixed>|null  $session
      */
-    private function attempt(string $cartClass, int|string $cartId, ?array $session, bool $checked, ?bool $collected): Order
+    private function attempt(string $cartClass, int|string $cartId, ?array $session, bool $checked, ?bool $collected, ?int $capturedAmount): Order
     {
         $cart = $this->freshCart($cartClass, $cartId);
         $cart->load(['zone.currency', 'zone.carriers', $cart->payment_session === null ? 'lines.purchasable' : 'lines.purchasable.prices.currency', 'addresses.country', 'customer']);
@@ -208,10 +245,53 @@ final readonly class CompleteCartAction
 
         return $this->createOrderFromCart->execute(
             $cart,
-            fn (CartPipelineContext $context) => $this->guardPaymentSession($cart, $context->total),
+            function (CartPipelineContext $context) use ($cart, $capturedAmount): void {
+                $this->guardPaymentSession($cart, $context->total);
+
+                if ($capturedAmount !== null && $capturedAmount !== $context->total) {
+                    throw new PaymentNotCapturedException('captured');
+                }
+            },
             fn (Order $order) => $this->recordInitiatedPayment($cart, $order),
             fn (): bool => $cart->payment_session === $session && $isCollected() !== false,
         );
+    }
+
+    /**
+     * The order is only placed over a payment the provider reports captured,
+     * in the cart currency; the captured amount is checked against the cart
+     * total inside the order transaction. Read before any side effect of
+     * the completion, so a refusal leaves the cart as it was.
+     *
+     * @param  array<string, mixed>  $session
+     */
+    private function capturedAmount(Cart $cart, array $session): int
+    {
+        try {
+            $payment = app(PaymentManager::class)->driver($session['driver'])->retrievePayment((string) $session['reference']);
+        } catch (Throwable $exception) {
+            throw new PaymentProviderUnavailableException($exception);
+        }
+
+        $currency = $payment->data['currency'] ?? null;
+
+        if (
+            $payment->status !== 'captured'
+            || $payment->amount === null
+            || ! is_string($currency)
+            || mb_strtoupper($currency) !== mb_strtoupper((string) $cart->currency_code)
+        ) {
+            throw new PaymentNotCapturedException($payment->status);
+        }
+
+        return $payment->amount;
+    }
+
+    private function compensations(): ?CompensationStore
+    {
+        $store = config('shopper.payment.compensation_store');
+
+        return is_string($store) && $store !== '' ? app($store) : null;
     }
 
     /**

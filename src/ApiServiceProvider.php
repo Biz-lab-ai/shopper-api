@@ -43,6 +43,19 @@ final class ApiServiceProvider extends PackageServiceProvider
     }
 
     /**
+     * The store routes stay off while `shopper.api.routes` is false, read at
+     * boot so the application configuration is complete.
+     */
+    protected function bootPackageRoutes(): self
+    {
+        if (! config('shopper.api.routes', true)) {
+            return $this;
+        }
+
+        return parent::bootPackageRoutes();
+    }
+
+    /**
      * Laravel merges a published config file on its top level only, which
      * would hide every resource or key added to the resources registry after
      * the file was published. The registry is merged one level deeper, a
