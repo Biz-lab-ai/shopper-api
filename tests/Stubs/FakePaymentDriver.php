@@ -22,6 +22,14 @@ final class FakePaymentDriver extends Driver
 
     public bool $throwOnCancel = false;
 
+    public bool $throwOnRefund = false;
+
+    public string $refundStatus = 'refunded';
+
+    public ?int $retrievedAmount = null;
+
+    public string $retrievedCurrency = 'usd';
+
     public ?Closure $onInitiate = null;
 
     public ?Closure $onRetrieve = null;
@@ -116,9 +124,13 @@ final class FakePaymentDriver extends Driver
     {
         $this->refunds[] = ['reference' => $reference, 'amount' => $amount, 'context' => $context];
 
+        if ($this->throwOnRefund) {
+            throw PaymentException::apiError($this->code(), 'Refund rejected.');
+        }
+
         return new PaymentResult(
             success: true,
-            status: 'refunded',
+            status: $this->refundStatus,
             reference: 're_'.count($this->refunds),
             amount: $amount,
         );
@@ -161,7 +173,8 @@ final class FakePaymentDriver extends Driver
                 success: true,
                 status: array_shift($this->retrievedStatuses) ?? $this->retrievedStatus,
                 reference: $reference,
-                amount: $this->lastAmount,
+                amount: $this->retrievedAmount ?? $this->lastAmount,
+                data: ['currency' => $this->retrievedCurrency],
             );
         }
 

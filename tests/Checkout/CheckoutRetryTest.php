@@ -6,112 +6,23 @@ use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Shopper\Api\Actions\CompleteCartAction;
-use Shopper\Api\Actions\CreateCartPaymentSessionAction;
 use Shopper\Api\Tests\Stubs\Conflict;
-use Shopper\Api\Tests\Stubs\FakePaymentDriver;
 use Shopper\Cart\Actions\CreateOrderFromCartAction;
 use Shopper\Cart\CartManager;
 use Shopper\Cart\Models\Cart;
 use Shopper\Cart\Models\CartPromotion;
-use Shopper\Core\Enum\AddressType;
 use Shopper\Core\Enum\DiscountApplyTo;
 use Shopper\Core\Enum\DiscountEligibility;
 use Shopper\Core\Enum\DiscountRequirement;
 use Shopper\Core\Enum\DiscountType;
-use Shopper\Core\Models\Carrier;
-use Shopper\Core\Models\CarrierOption;
-use Shopper\Core\Models\Country;
-use Shopper\Core\Models\Currency;
 use Shopper\Core\Models\Discount;
-use Shopper\Core\Models\Inventory;
-use Shopper\Core\Models\InventoryHistory;
 use Shopper\Core\Models\Order;
-use Shopper\Core\Models\PaymentMethod;
-use Shopper\Core\Models\Product;
-use Shopper\Core\Models\Zone;
 use Shopper\Http\Enum\ErrorCode;
-use Shopper\Http\Exceptions\ApiValidationException;
-use Shopper\Payment\Facades\Payment;
 use Shopper\Payment\Models\PaymentTransaction;
 
 beforeEach(function (): void {
-    setupCurrencies();
-
-    $country = Country::factory()->create(['cca2' => 'US']);
-    $this->zone = Zone::factory()->create(['is_enabled' => true]);
-    $this->zone->countries()->attach($country);
-
-    $carrier = Carrier::factory()->create(['name' => 'Main Carrier', 'slug' => 'main-carrier', 'is_enabled' => true]);
-    $this->zone->carriers()->attach($carrier);
-
-    $this->option = CarrierOption::factory()->create([
-        'name' => 'Standard',
-        'price' => 100,
-        'is_enabled' => true,
-        'carrier_id' => $carrier->id,
-        'zone_id' => $this->zone->id,
-    ]);
-
-    $this->inventory = Inventory::factory()->create(['is_default' => true, 'priority' => 0]);
-    $this->product = Product::factory()->standard()->publish()->create();
-    $this->product->mutateStock($this->inventory->id, 100);
-    $this->product->prices()->create([
-        'amount' => 2500,
-        'currency_id' => Currency::query()->where('code', 'USD')->value('id'),
-    ]);
-
-    $this->cart = Cart::factory()->create(['currency_code' => 'USD', 'email' => 'john@example.com', 'zone_id' => $this->zone->id]);
-    $this->cart->lines()->create([
-        'purchasable_type' => $this->product->getMorphClass(),
-        'purchasable_id' => $this->product->id,
-        'quantity' => 1,
-        'unit_price_amount' => 2500,
-    ]);
-    $this->cart->addresses()->create([
-        'type' => AddressType::Shipping,
-        'first_name' => 'John',
-        'last_name' => 'Doe',
-        'address_1' => '1 Main Street',
-        'city' => 'New York',
-        'postal_code' => '10001',
-    ]);
-    $this->cart->update([
-        'shipping_option_id' => "main-carrier:{$this->option->public_id}",
-        'shipping_amount' => $this->option->price,
-    ]);
-
-    $driver = $this->driver = new FakePaymentDriver;
-    Payment::extend('fake', fn (): FakePaymentDriver => $driver);
-    $method = PaymentMethod::factory()->create(['title' => 'Card', 'is_enabled' => true, 'driver' => 'fake']);
-    $method->zones()->attach($this->zone);
-    $this->cart->update(['payment_method_id' => $method->id]);
-
-    $this->runner = recordingStockRunner();
+    seedCheckoutCart($this);
 });
-
-function openPaymentSession(Cart $cart): void
-{
-    app(CreateCartPaymentSessionAction::class)->execute($cart->refresh());
-}
-
-function completeCart(Cart $cart): Order
-{
-    /** @var Order $order */
-    $order = app(CompleteCartAction::class)->execute(Cart::query()->findOrFail($cart->id));
-
-    return $order;
-}
-
-function checkoutCode(Closure $complete): ?ErrorCode
-{
-    try {
-        $complete();
-    } catch (ApiValidationException $exception) {
-        return $exception->errorCode;
-    }
-
-    return null;
-}
 
 /**
  * Throw the snapshot conflict once, the first time the event fires inside
@@ -128,11 +39,6 @@ function conflictOnceInTransaction(string $event): void
             throw Conflict::snapshot();
         }
     });
-}
-
-function reservations(): int
-{
-    return InventoryHistory::query()->where('reference_type', (new Order)->getMorphClass())->count();
 }
 
 describe('CheckoutRetryTest', function (): void {

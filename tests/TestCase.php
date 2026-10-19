@@ -24,6 +24,11 @@ abstract class TestCase extends BaseTestCase
     use RefreshDatabase;
 
     /**
+     * The store routes switch of the next application, null for the default.
+     */
+    public static ?bool $apiRoutes = null;
+
+    /**
      * The checkout repeats only from the outermost transaction level, so the
      * tests run committed, like a request, and empty the tables after.
      *
@@ -108,6 +113,10 @@ abstract class TestCase extends BaseTestCase
             $migrator->path(dirname(__DIR__).'/vendor/shopper/cart/database/migrations');
         });
         $app['config']->set('scout.driver', null);
+
+        if (self::$apiRoutes !== null) {
+            $app['config']->set('shopper.api.routes', self::$apiRoutes);
+        }
         $app['config']->set('auth.providers.users.model', Stubs\User::class);
         $app['config']->set('shopper.models', [
             'address' => Models\Address::class,
