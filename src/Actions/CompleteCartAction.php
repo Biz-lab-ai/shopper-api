@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Shopper\Api\Actions;
 
 use LogicException;
+use Shopper\Api\Concerns\EnsuresCartEmail;
 use Shopper\Api\Exceptions\PaymentNotCapturedException;
 use Shopper\Cart\Actions\CreateOrderFromCartAction;
 use Shopper\Cart\CartManager;
@@ -36,6 +37,8 @@ use Throwable;
 
 final readonly class CompleteCartAction
 {
+    use EnsuresCartEmail;
+
     public function __construct(
         private RefreshCartShippingAction $refreshShipping,
         private CartManager $cartManager,
@@ -121,7 +124,7 @@ final readonly class CompleteCartAction
             ]);
         }
 
-        $this->ensureEmail($cart);
+        $this->ensureEmail($this->cartManager, $cart);
 
         $session = $cart->payment_session;
         $checked = false;
@@ -338,28 +341,6 @@ final readonly class CompleteCartAction
     {
         $this->cartManager->releasePaymentSession($cart);
         $this->cartManager->calculate($cart->unsetRelations());
-    }
-
-    /**
-     * Freeze the contact email on the cart so the order can be confirmed and
-     * looked up. A customer cart falls back to the customer's own email; a
-     * guest cart must carry one, set at creation or with the checkout address.
-     */
-    private function ensureEmail(Cart $cart): void
-    {
-        if ($cart->email !== null) {
-            return;
-        }
-
-        $email = $cart->customer?->getAttribute('email');
-
-        if (! is_string($email)) {
-            throw ApiValidationException::withCode(ErrorCode::EmailRequired, [
-                'email' => __('shopper-api::messages.cart.email_required'),
-            ]);
-        }
-
-        $this->cartManager->setEmail($cart, $email);
     }
 
     private function guardPaymentSession(Cart $cart, int $total): void

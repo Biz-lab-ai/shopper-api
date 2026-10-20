@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Shopper\Api\Actions;
 
 use Illuminate\Support\Str;
+use Shopper\Api\Concerns\EnsuresCartEmail;
 use Shopper\Api\Concerns\LocksPaymentSession;
 use Shopper\Api\Support\PaymentSession;
 use Shopper\Cart\CartManager;
@@ -25,6 +26,7 @@ use Throwable;
 
 final readonly class CreateCartPaymentSessionAction
 {
+    use EnsuresCartEmail;
     use LocksPaymentSession;
 
     public function __construct(
@@ -56,6 +58,9 @@ final readonly class CreateCartPaymentSessionAction
                     'payment_method' => __('shopper-api::messages.payment.method_required_for_session'),
                 ]);
             }
+
+            // A session without a contact could be paid and never completed (EnsuresCartEmail).
+            $this->ensureEmail($this->cartManager, $cart);
 
             $driverCode = $method->driver ?? 'manual';
 
