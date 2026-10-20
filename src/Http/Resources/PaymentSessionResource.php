@@ -22,9 +22,10 @@ class PaymentSessionResource extends JsonApiResource
      * The driver `data` array is an internal grab bag: only keys a storefront
      * legitimately needs cross the wire. Everything else (provider object
      * ids, charge references, whatever a third-party driver stuffed in)
-     * stays server-side.
+     * stays server-side. The connected account is public on purpose: a
+     * client confirming the intent initialises the provider SDK with it.
      */
-    private const PUBLIC_DATA = ['publishable_key', 'idempotency_key', 'stripe_status'];
+    private const PUBLIC_DATA = ['publishable_key', 'idempotency_key', 'stripe_status', 'stripe_account'];
 
     public function toId(Request $request): string
     {
