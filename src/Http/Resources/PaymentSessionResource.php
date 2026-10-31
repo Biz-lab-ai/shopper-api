@@ -10,7 +10,7 @@ use Shopper\Api\Support\PaymentSession;
 
 /**
  * Serializes a driver-initiated payment session, not an Eloquent model. The
- * id is the driver reference (a Stripe payment intent id, ...) the client
+ * id is the driver reference the client
  * confirms against; the attributes carry whatever the driver needs on the
  * storefront side (client secret, publishable key, redirect url).
  *
@@ -22,10 +22,9 @@ class PaymentSessionResource extends JsonApiResource
      * The driver `data` array is an internal grab bag: only keys a storefront
      * legitimately needs cross the wire. Everything else (provider object
      * ids, charge references, whatever a third-party driver stuffed in)
-     * stays server-side. The connected account is public on purpose: a
-     * client confirming the intent initialises the provider SDK with it.
+     * stays server-side.
      */
-    private const PUBLIC_DATA = ['publishable_key', 'idempotency_key', 'stripe_status', 'stripe_account'];
+    private const PUBLIC_DATA = ['publishable_key', 'idempotency_key'];
 
     public function toId(Request $request): string
     {

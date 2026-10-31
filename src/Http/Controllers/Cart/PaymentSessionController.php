@@ -25,7 +25,7 @@ final class PaymentSessionController
      * Open a payment session for the cart.
      *
      * The driver of the cart's payment method initiates the collection
-     * (a Stripe payment intent, ...) for the pipeline-computed total and the
+     * for the pipeline-computed total and the
      * response carries what the storefront needs to confirm it: client
      * secret, publishable key, redirect url. Posting again with an unchanged
      * total resumes the same session.
